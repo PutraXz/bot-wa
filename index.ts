@@ -29,7 +29,7 @@ async function connectToWhatsApp() {
 
   sock.ev.on("messages.upsert", async (m) => {
     console.log(m.messages[0]);
-    if (m.messages[0].message?.conversation === "Comment") {
+    if (m.messages[0].message?.conversation === "!ping" + " ") {
       const groupData = await sock.groupMetadata(
         m.messages[0].key.remoteJid as string
       );
