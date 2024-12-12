@@ -1,0 +1,180 @@
+import makeWASocket, { DisconnectReason, useMultiFileAuthState } from "@whiskeysockets/baileys";
+import { Boom } from "@hapi/boom";
+import * as fs from "fs";
+
+let dataCache = { message: [] };
+const groupMetadataCache = new Map();
+
+const loadData = () => {
+  try {
+    const rawData = fs.readFileSync("data.json", "utf-8");
+    dataCache = JSON.parse(rawData);
+  } catch (err) {
+    console.log("File data.json tidak ditemukan, membuat cache baru.");
+    dataCache = { message: [] };
+  }
+};
+
+const saveData = () => {
+  try {
+    fs.writeFileSync("data.json", JSON.stringify(dataCache, null, 2));
+    console.log("Data berhasil disimpan ke file.");
+  } catch (err) {
+    console.error("Gagal menyimpan data:", err);
+  }
+};
+
+const getGroupMetadata = async (sock, groupId) => {
+  if (!groupMetadataCache.has(groupId)) {
+    const metadata = await sock.groupMetadata(groupId);
+    groupMetadataCache.set(groupId, metadata);
+  }
+  return groupMetadataCache.get(groupId);
+};
+
+async function connectToWhatsApp() {
+  const { state, saveCreds } = await useMultiFileAuthState("session");
+  const sock = makeWASocket({
+    auth: state,
+    printQRInTerminal: true,
+  });
+
+  sock.ev.on("creds.update", saveCreds);
+  sock.ev.on("connection.update", (update) => {
+    const { connection, lastDisconnect } = update;
+    if (connection === "close") {
+      const shouldReconnect =
+        (lastDisconnect!.error as Boom)?.output?.statusCode !== DisconnectReason.loggedOut;
+      console.log("Connection closed due to: ", lastDisconnect!.error);
+      if (shouldReconnect) {
+        connectToWhatsApp();
+      }
+    } else if (connection === "open") {
+      console.log("Opened connection");
+    }
+  });
+
+  sock.ev.on("messages.upsert", async (m) => {
+    const allowedNumbers = [
+      "62895391518953@s.whatsapp.net",
+      "628972365549@s.whatsapp.net",
+      "6285261378437@s.whatsapp.net",
+      "6282162621163@s.whatsapp.net",
+      "6283836002673@s.whatsapp.net",
+      "6285762793274@s.whatsapp.net",
+      "62895422059961@s.whatsapp.net",
+      "6282365559541@s.whatsapp.net",
+      "6282267749275@s.whatsapp.net",
+    ];
+
+    const msg = m.messages[0];
+    if (msg.key.fromMe) return;
+
+    const sendNumber = msg.key.participant || msg.key.remoteJid;
+    if (!allowedNumbers.includes(sendNumber)) {
+      console.log(`Nomor ${sendNumber} tidak diizinkan mengirim pesan`);
+      return;
+    }
+
+    const textMessage = msg.message?.conversation || "";
+    const quotedMessage = msg.message?.extendedTextMessage?.contextInfo?.quotedMessage?.conversation;
+
+    const isCommand = (cmd: string) => textMessage.startsWith(cmd);
+
+    if (isCommand("!ping") || quotedMessage) {
+      try {
+        const groupData = await getGroupMetadata(sock, msg.key.remoteJid as string);
+        const mentionedJidList = groupData.participants.map((p) => p.id);
+
+        const quotedSender = msg.message?.extendedTextMessage?.contextInfo?.participant;
+        const quotedMessageId = msg.message?.extendedTextMessage?.contextInfo?.stanzaId;
+        if (quotedSender && quotedMessageId) {
+          console.log("Mendeteksi pesan reply...");
+          console.log("Quoted Sender:", quotedSender);
+          console.log("Quoted Message ID:", quotedMessageId);
+          console.log("Quoted Message Content:", msg.message?.extendedTextMessage?.contextInfo?.quotedMessage);
+        
+          // Validasi apakah quotedMessage tersedia
+          if (!msg.message?.extendedTextMessage?.contextInfo?.quotedMessage) {
+            await sock.sendMessage(msg.key.remoteJid as string, {
+              text: `Gagal memproses reply: Konten pesan tidak ditemukan.`,
+            });
+            return;
+          }
+        
+          await sock.sendMessage(msg.key.remoteJid as string, {
+            text: `@everyone`,
+            mentions: [quotedSender],
+            contextInfo: {
+              stanzaId: quotedMessageId,
+              participant: quotedSender,
+              quotedMessage: msg.message?.extendedTextMessage?.contextInfo?.quotedMessage,
+            },
+          });
+        } else {
+          console.log("Tidak ada konteks pesan reply yang valid.");
+          await sock.sendMessage(msg.key.remoteJid as string, {
+            text: "@everyone",
+            mentions: mentionedJidList,
+          });
+        }        
+      } catch (err) {
+        console.error("Error handling !ping command:", err);
+      }
+    }
+
+    if (isCommand(".tambah")) {
+      const splitMessage = textMessage.split(".tambah")[1]?.trim();
+      if (!splitMessage) {
+        await sock.sendMessage(msg.key.remoteJid as string, {
+          text: "Format salah. Gunakan: .tambah <nomor>",
+        });
+        return;
+      }
+
+      const senderId = msg.key.participant;
+      const isNumberExist = dataCache.message.some((item) => item.number === splitMessage);
+
+      if (isNumberExist) {
+        await sock.sendMessage(msg.key.remoteJid as string, {
+          text: `Nomor ${splitMessage} sudah ada dalam daftar.`,
+        });
+      } else {
+        dataCache.message.push({
+          number: splitMessage,
+          sender: senderId,
+          tanggal: new Date().toISOString().split("T")[0],
+        });
+        saveData();
+        await sock.sendMessage(msg.key.remoteJid as string, {
+          text: `Nomor ${splitMessage} berhasil ditambahkan.`,
+        });
+      }
+    }
+
+    if (isCommand(".cari")) {
+      const splitMessage = textMessage.split(".cari")[1]?.trim();
+      if (!splitMessage) {
+        await sock.sendMessage(msg.key.remoteJid as string, {
+          text: "Format salah. Gunakan: .cari <nomor>",
+        });
+        return;
+      }
+
+      const matchedNumber = dataCache.message.find((n) => n.number === splitMessage);
+      if (matchedNumber) {
+        const finalNumber = matchedNumber.sender.split("@")[0];
+        await sock.sendMessage(msg.key.remoteJid as string, {
+          text: `Nomor ${splitMessage} ada dalam daftar.\nPengirim: ${finalNumber}\nTanggal: ${matchedNumber.tanggal}`,
+        });
+      } else {
+        await sock.sendMessage(msg.key.remoteJid as string, {
+          text: `Nomor ${splitMessage} tidak ada dalam daftar.`,
+        });
+      }
+    }
+  });
+}
+
+loadData();
+connectToWhatsApp();
