@@ -2,7 +2,9 @@ import makeWASocket, {
   DisconnectReason,
   useMultiFileAuthState,
   downloadMediaMessage,
+  fetchLatestBaileysVersion
 } from "@whiskeysockets/baileys";
+
 import { Boom } from "@hapi/boom";
 const { GoogleGenerativeAI } = require("@google/generative-ai");
 import axios from "axios";
@@ -11,6 +13,8 @@ import pino from "pino";
 import fs from 'fs';
 import { get } from "http";
 import NextcloudClient from 'nextcloud-link';
+import qrcode from "qrcode-terminal"; 
+
 const path = require('path');
 const logger = pino({ level: "info" });
 const apiKey = new GoogleGenerativeAI("AIzaSyBSLzrtC9xcwWbGTZszY6SiQ8KOh0sU3Cg");
@@ -189,26 +193,52 @@ async function runFfmpegOnNextcloud() {
 
 async function connectToWhatsApp() {
   const { state, saveCreds } = await useMultiFileAuthState("session");
-  const sock = makeWASocket({
-    auth: state,
-    printQRInTerminal: true,
-  });
+ 
+const sock = makeWASocket({
+  version,
+  auth: state,
+  printQRInTerminal: false, // ⬅️ matikan pesan deprecated
+  logger,
+  browser: ["Ubuntu", "Chrome", "124.0"],
+  connectTimeoutMs: 60_000,
+  keepAliveIntervalMs: 20_000,
+  defaultQueryTimeoutMs: 60_000,
+  syncFullHistory: false,
+});
 
-  sock.ev.on("creds.update", saveCreds);
-  sock.ev.on("connection.update", (update) => {
-    const { connection, lastDisconnect } = update;
-    if (connection === "close") {
-      const shouldReconnect =
-        (lastDisconnect!.error as Boom)?.output?.statusCode !==
-        DisconnectReason.loggedOut;
-      console.log("Connection closed due to: ", lastDisconnect!.error);
-      if (shouldReconnect) {
-        connectToWhatsApp();
-      }
-    } else if (connection === "open") {
-      console.log("Opened connection");
-    }
-  });
+sock.ev.on("connection.update", (u) => {
+  const { connection, lastDisconnect, qr } = u;
+
+  // ⬅️ cetak QR ke terminal saat diterima
+  if (qr) {
+    console.log("Scan QR berikut (kedaluwarsa ~20 detik):");
+    qrcode.generate(qr, { small: true });
+  }
+
+  if (connection === "open") {
+    logger.info("✅ Connected to WhatsApp");
+  } else if (connection === "close") {
+    const statusCode =
+      (lastDisconnect?.error as any)?.output?.statusCode ||
+      (lastDisconnect?.error as any)?.status ||
+      (lastDisconnect?.error as any)?.code;
+
+    const shouldReconnect =
+      statusCode !== DisconnectReason.loggedOut &&
+      statusCode !== DisconnectReason.badSession &&
+      statusCode !== 401;
+
+    if (shouldReconnect) {
+      logger.info("Reconnecting...");
+      connect().catch((e) => logger.error(e, "reconnect failed"));
+    } else {
+      logger.error("Not reconnecting (logged out / bad session). Hapus folder 's
+ession' lalu start lagi.");
+    }
+  }
+});
+
+  
   sock.ev.on("messages.upsert", async (m) => {
     
     const msg = m.messages[0];
